@@ -32,62 +32,62 @@ def regenerate_ids_each_run():
     st.session_state.user_id = f"user_{str(uuid.uuid4())[:8]}"
 
 
+def _normalize_nested_json(payload):
+    """Best-effort to unwrap double-encoded API payloads (response/answer as JSON strings)."""
+    current = payload
+    # Attempt up to 3 unwrapping passes
+    for _ in range(3):
+        # String → try JSON
+        if isinstance(current, str):
+            try:
+                maybe = json.loads(current)
+                current = maybe
+            except (json.JSONDecodeError, TypeError):
+                break
+        # Dict with inner JSON strings
+        if isinstance(current, dict):
+            # Prefer inner 'response' if it's a JSON string
+            inner = current.get("response")
+            if isinstance(inner, str):
+                try:
+                    current = json.loads(inner)
+                    continue
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # Or inner 'answer' if it's a JSON string containing the full object
+            inner_ans = current.get("answer")
+            if isinstance(inner_ans, str) and inner_ans.strip().startswith("{"):
+                try:
+                    current = json.loads(inner_ans)
+                    continue
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        break
+    return current
+
+
 def render_json_response_block(response_payload):
     """Render a rich view for dict/JSON string; fallback to plain text for others."""
-    # Normalize to dict if possible
-    parsed = None
-    if isinstance(response_payload, dict):
-        parsed = response_payload
-    elif isinstance(response_payload, str):
-        try:
-            parsed = json.loads(response_payload)
-        except (json.JSONDecodeError, TypeError):
-            parsed = None
-
+    parsed = _normalize_nested_json(response_payload)
+    
     if isinstance(parsed, dict):
-        # Primary answer
+        # Show main answer text
         if parsed.get("answer"):
             st.markdown(parsed["answer"])
 
-        # Booking context
-        if parsed.get("booking_context"):
-            with st.expander("Booking Details"):
-                ctx = parsed["booking_context"]
-                st.markdown(f"**Service:** {ctx.get('service', 'N/A')}")
-                st.markdown(f"**Doctor:** {ctx.get('doctor', 'N/A')}")
-                st.markdown(f"**Date:** {ctx.get('date', 'N/A')}")
-                st.markdown(f"**Time:** {ctx.get('time', 'N/A')}")
+        # Minimal booking context card if present
+        ctx = parsed.get("booking_context")
+        if isinstance(ctx, dict) and any(ctx.get(k) for k in ("service", "doctor", "date", "time")):
+            with st.container(border=True):
+                st.markdown("**Booking Details**")
+                cols = st.columns(2)
+                with cols[0]:
+                    st.caption(f"Service: {ctx.get('service', 'N/A')}")
+                    st.caption(f"Doctor: {ctx.get('doctor', 'N/A')}")
+                with cols[1]:
+                    st.caption(f"Date: {ctx.get('date', 'N/A')}")
+                    st.caption(f"Time: {ctx.get('time', 'N/A')}")
 
-        # Information gathered
-        if parsed.get("information_gathered"):
-            st.markdown("#### Information Gathered")
-            for i, info in enumerate(parsed["information_gathered"], 1):
-                st.markdown(f"{i}. {info}")
-
-        # Assessment progress
-        if "assessment_progress" in parsed:
-            if parsed["assessment_progress"] == "complete":
-                st.success("Assessment Complete")
-            else:
-                st.info(f"Assessment Progress: {parsed['assessment_progress']}")
-
-        # Recommendations
-        if parsed.get("recommendations"):
-            st.markdown("#### Recommendations")
-            for i, rec in enumerate(parsed["recommendations"], 1):
-                st.markdown(f"{i}. {rec}")
-
-        # Next steps
-        if parsed.get("next_steps"):
-            st.markdown("#### Next Steps")
-            for i, step in enumerate(parsed["next_steps"], 1):
-                st.markdown(f"{i}. {step}")
-
-        # Sources
-        if parsed.get("sources"):
-            with st.expander("Sources"):
-                for source in parsed["sources"]:
-                    st.markdown(f"- {source}")
         return
 
     # Fallback: show as plain text
@@ -96,11 +96,7 @@ def render_json_response_block(response_payload):
 
 def render_mcq_if_present(raw_content: str, key_prefix: str, slot_id: str | None):
     """Render MCQ inputs if payload indicates an MCQ; return True if MCQ handled (blocks free input)."""
-    try:
-        parsed = json.loads(raw_content)
-    except (json.JSONDecodeError, TypeError):
-        return False
-
+    parsed = _normalize_nested_json(raw_content)
     if not isinstance(parsed, dict):
         return False
 
@@ -146,8 +142,12 @@ def render_mcq_if_present(raw_content: str, key_prefix: str, slot_id: str | None
                 else:
                     response_text = data.get("response", "No response received")
 
-                render_json_response_block(response_text)
-                # If the new response is again MCQ, keep flow; caller will call this again on rerun
+                # Append to the appropriate chat history and rerun
+                msg = {"role": "assistant", "content": response_text}
+                if "current_slot_id" in st.session_state and st.session_state.get("booking_history") is not None:
+                    st.session_state.booking_history.append(msg)
+                if st.session_state.get("post_ctx") is not None and st.session_state.get("post_history") is not None:
+                    st.session_state.post_history.append(msg)
                 st.rerun()
             else:
                 st.error(result.get("error", "Unknown error"))
@@ -163,7 +163,13 @@ def ask_mode():
 
     for idx, msg in enumerate(st.session_state.ask_history):
         with st.chat_message(msg["role"]):
-            render_json_response_block(msg["content"]) if msg["role"] == "assistant" else st.markdown(msg["content"]) 
+            content = msg.get("content")
+            if msg["role"] == "assistant":
+                if isinstance(content, (str, dict)):
+                    render_json_response_block(content)
+            else:
+                if isinstance(content, str):
+                    st.markdown(content)
 
     prompt = st.chat_input("Ask about healthcare services...")
     if prompt:
@@ -255,11 +261,15 @@ def booking_chat_mode():
         for idx, msg in enumerate(st.session_state.booking_history):
             with st.chat_message(msg["role"]):
                 if msg["role"] == "assistant":
-                    # Try MCQ render; if not MCQ, show rich JSON
-                    if not render_mcq_if_present(msg["content"], key_prefix=f"book_hist_{idx}", slot_id=st.session_state.current_slot_id):
-                        render_json_response_block(msg["content"])
+                    content = msg.get("content")
+                    if isinstance(content, (str, dict)):
+                        # Try MCQ render; if not MCQ, show rich JSON
+                        if not render_mcq_if_present(content, key_prefix=f"book_hist_{idx}", slot_id=st.session_state.current_slot_id):
+                            render_json_response_block(content)
                 else:
-                    st.markdown(msg["content"])
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        st.markdown(content)
 
         # If last assistant message is MCQ, free input is blocked by the MCQ submit flow
         # Otherwise, show chat input
@@ -340,63 +350,197 @@ def upload_urls_mode():
         if result["success"]:
             data = result["data"]
             st.success("Files processed successfully!")
-            response_text = data.get("response", "{}")
-            try:
-                parsed = json.loads(response_text)
-                if isinstance(parsed, dict) and parsed.get("processed_files"):
-                    st.markdown("### File Processing Results")
-                    processed_files = parsed["processed_files"]
-                    total_processed = parsed.get("total_processed", len(processed_files))
-                    total_successful = parsed.get("total_successful", sum(1 for f in processed_files if f.get("success")))
+            # Normalize nested response formats (stringified JSON, answer/response nesting)
+            parsed = _normalize_nested_json(data.get("response", {}))
+            if not isinstance(parsed, dict) or not parsed.get("processed_files"):
+                parsed = _normalize_nested_json(data.get("answer", {}))
+            if not isinstance(parsed, dict) or not parsed.get("processed_files"):
+                parsed = _normalize_nested_json(data)
 
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        st.metric("Total Files", total_processed)
-                    with c2:
-                        st.metric("Successfully Processed", total_successful)
-                    with c3:
-                        rate = (total_successful / total_processed * 100) if total_processed else 0
-                        st.metric("Success Rate", f"{rate:.1f}%")
+            if isinstance(parsed, dict) and parsed.get("processed_files"):
+                st.markdown("### File Processing Results")
+                processed_files = parsed["processed_files"]
+                total_processed = parsed.get("total_processed", len(processed_files))
+                total_successful = parsed.get("total_successful", sum(1 for f in processed_files if f.get("success")))
 
-                    st.markdown("---")
-                    for i, info in enumerate(processed_files, 1):
-                        st.markdown(f"### File {i}: {info.get('file_url', 'Unknown').split('/')[-1]}")
-                        if info.get("success"):
-                            st.success("Successfully Processed")
-                        else:
-                            st.error("Processing Failed")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("Total Files", total_processed)
+                with c2:
+                    st.metric("Successfully Processed", total_successful)
+                with c3:
+                    rate = (total_successful / total_processed * 100) if total_processed else 0
+                    st.metric("Success Rate", f"{rate:.1f}%")
 
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown(f"**File Type:** {info.get('file_type', 'Unknown').upper()}")
-                            st.markdown(f"**Healthcare Related:** {'Yes' if info.get('is_healthcare_related', False) else 'No'}")
-                        with col2:
-                            st.markdown(f"**File URL:** `{info.get('file_url', 'N/A')}`")
+                st.markdown("---")
+                for i, info in enumerate(processed_files, 1):
+                    st.markdown(f"### File {i}: {info.get('file_url', 'Unknown').split('/')[-1]}")
+                    if info.get("success"):
+                        st.success("Successfully Processed")
+                    else:
+                        st.error("Processing Failed")
 
-                        if info.get("summary"):
-                            st.markdown("#### Summary")
-                            st.markdown(info["summary"])
-                        if info.get("description"):
-                            st.markdown("#### Description")
-                            st.markdown(info["description"])
-                        if info.get("error"):
-                            st.markdown("#### Error")
-                            st.error(info["error"])
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(f"**File Type:** {info.get('file_type', 'Unknown').upper()}")
+                        st.markdown(f"**Healthcare Related:** {'Yes' if info.get('is_healthcare_related', False) else 'No'}")
+                        if info.get("doc_type"):
+                            st.caption(f"Doc Type: {info.get('doc_type')}")
+                    with col2:
+                        st.markdown(f"**File URL:** `{info.get('file_url', 'N/A')}`")
 
-                        if i < len(processed_files):
-                            st.markdown("---")
-                else:
-                    st.markdown("### Processing Result")
-                    st.text_area("Result", response_text, height=200, disabled=True, label_visibility="collapsed")
-            except (json.JSONDecodeError, TypeError):
+                    if info.get("summary"):
+                        st.markdown("#### Summary")
+                        st.markdown(info["summary"])
+                    if info.get("description"):
+                        st.markdown("#### Description")
+                        st.markdown(info["description"])
+                    if info.get("error"):
+                        st.markdown("#### Error")
+                        st.error(info["error"])
+
+                    if i < len(processed_files):
+                        st.markdown("---")
+            else:
+                # Fallback to raw display
+                raw_text = data.get("response") or data.get("answer") or "{}"
                 st.markdown("### Processing Result")
-                st.text_area("Result", response_text, height=200, disabled=True, label_visibility="collapsed")
+                st.text_area("Result", raw_text, height=200, disabled=True, label_visibility="collapsed")
 
-            if data.get("booking_summary"):
-                st.markdown("### Booking Summary")
-                st.json(data["booking_summary"])
-        else:
-            st.error(f"File processing failed: {result['error']}")
+
+def _render_treatment_plan(plan_items):
+    if not isinstance(plan_items, list):
+        return
+    for i, item in enumerate(plan_items, 1):
+        st.markdown(f"### Plan {i}: {item.get('service', 'Treatment')}")
+        specs_text = item.get("specifications_text")
+        specs = item.get("specifications")
+        if specs_text:
+            st.caption(specs_text)
+        if isinstance(specs, dict) and specs:
+            with st.expander("Specifications"):
+                for k, v in specs.items():
+                    st.markdown(f"- **{k}**: {v}")
+        if item.get("rationale"):
+            st.markdown("**Rationale**")
+            st.markdown(item["rationale"])
+        if isinstance(item.get("steps"), list) and item["steps"]:
+            st.markdown("**Steps**")
+            for step in item["steps"]:
+                st.markdown(f"- {step}")
+        if item.get("estimated_sessions") is not None:
+            st.caption(f"Estimated sessions: {item.get('estimated_sessions')}")
+        if item.get("follow_up"):
+            st.caption(f"Follow-up: {item.get('follow_up')}")
+        if isinstance(item.get("buttons"), list) and item["buttons"]:
+            cols = st.columns(min(3, len(item["buttons"])))
+            for idx_btn, btn in enumerate(item["buttons"][:3]):
+                with cols[idx_btn]:
+                    st.button(btn.get("label", "Action"), use_container_width=True, key=f"tp_btn_{i}_{idx_btn}")
+        if i < len(plan_items):
+            st.markdown("---")
+
+
+def post_consultation_mode():
+    st.subheader("Post Consultation")
+    st.markdown("Provide Slot ID and post consultation text (doctor's notes).")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        slot_id = st.text_input("Slot ID", placeholder="e.g., slot_123", key="post_slot_id")
+    with col2:
+        submit = st.button("Process", type="primary", use_container_width=True)
+
+    post_text = st.text_area("Post Consultation Text", height=160, placeholder="e.g., 1500 grafts, frontal area, FUE. Consider contour refinement ...")
+
+    # Initialize chat state for post-consultation
+    if "post_history" not in st.session_state:
+        st.session_state.post_history = []
+    if "post_ctx" not in st.session_state:
+        st.session_state.post_ctx = None
+
+    if submit:
+        if not slot_id or not post_text.strip():
+            st.warning("Please enter both Slot ID and Post Consultation Text.")
+            return
+        # Save context for chat; do NOT call API yet. Chat input will trigger first call.
+        st.session_state.post_ctx = {"slot_id": slot_id, "post_text": post_text}
+        st.session_state.post_history = []
+        st.success("Context saved. You can now chat to generate or refine the treatment plan.")
+
+    # If context set, render chat-style interface
+    if st.session_state.post_ctx:
+        st.info(f"Current Slot ID: {st.session_state.post_ctx['slot_id']}")
+
+        chat_container = st.container()
+        with chat_container:
+            for idx, msg in enumerate(st.session_state.post_history):
+                with st.chat_message(msg["role"]):
+                    content = msg.get("content")
+                    if msg["role"] == "assistant":
+                        # Render answer and treatment plan
+                        parsed = _normalize_nested_json(content)
+                        # Try MCQ first for post-consultation flow
+                        if isinstance(parsed, (str, dict)) and render_mcq_if_present(
+                            parsed if isinstance(parsed, str) else json.dumps(parsed),
+                            key_prefix=f"post_hist_{idx}",
+                            slot_id=st.session_state.post_ctx["slot_id"],
+                        ):
+                            pass
+                        else:
+                            if isinstance(parsed, dict):
+                                ans = parsed.get("answer")
+                                if isinstance(ans, str) and ans.strip():
+                                    st.markdown(ans)
+                                plan = parsed.get("treatment_plan")
+                                if plan:
+                                    st.markdown("---")
+                                    st.markdown("## Treatment Plan")
+                                    _render_treatment_plan(plan)
+                                if parsed.get("additional_recommendations"):
+                                    st.markdown("#### Additional Recommendations")
+                                    for rec in parsed.get("additional_recommendations", []):
+                                        st.markdown(f"- {rec}")
+                                if parsed.get("warnings"):
+                                    st.markdown("#### Warnings")
+                                    for w in parsed.get("warnings", []):
+                                        st.markdown(f"- {w}")
+                                # Show full JSON for debugging/inspection
+                                with st.expander("Raw JSON"):
+                                    st.json(parsed)
+                            elif isinstance(content, str):
+                                st.markdown(content)
+                    else:
+                        if isinstance(content, str):
+                            st.markdown(content)
+
+        # Chat input for follow-ups
+        user_msg = st.chat_input("Ask follow-up or refine plan...")
+        if user_msg:
+            st.session_state.post_history.append({"role": "user", "content": user_msg})
+            with st.chat_message("user"):
+                st.markdown(user_msg)
+
+            ctx = st.session_state.post_ctx
+            payload = {
+                "session_id": st.session_state.session_id,
+                "user_id": st.session_state.user_id,
+                "slot_id": ctx["slot_id"],
+                "post_consultation_text": ctx["post_text"],
+                "input": user_msg,
+            }
+            with st.spinner("Processing..."):
+                result = make_api_request(payload)
+
+            if result.get("success"):
+                data = result["data"]
+                parsed = _normalize_nested_json(data.get("response", {}))
+                if not isinstance(parsed, dict) or not parsed:
+                    parsed = _normalize_nested_json(data.get("answer", {}))
+                st.session_state.post_history.append({"role": "assistant", "content": parsed or (data.get("response") or data.get("answer") or "")})
+                st.rerun()
+            else:
+                st.error(result.get("error", "Unknown error"))
 
 
 def main():
@@ -410,7 +554,7 @@ def main():
     if "dep_selected_mode" not in st.session_state:
         st.session_state.dep_selected_mode = "Ask"
 
-    b1, b2, b3 = st.columns(3)
+    b1, b2, b3, b4 = st.columns(4)
     with b1:
         if st.button("💬 Ask", use_container_width=True):
             st.session_state.dep_selected_mode = "Ask"
@@ -420,6 +564,9 @@ def main():
     with b3:
         if st.button("📤 Upload (URLs)", use_container_width=True):
             st.session_state.dep_selected_mode = "Upload"
+    with b4:
+        if st.button("📝 Post Consultation", use_container_width=True):
+            st.session_state.dep_selected_mode = "Post"
 
     # IDs panel
     st.caption(f"Session ID: {st.session_state.session_id}")
@@ -433,6 +580,8 @@ def main():
         booking_chat_mode()
     elif st.session_state.dep_selected_mode == "Upload":
         upload_urls_mode()
+    elif st.session_state.dep_selected_mode == "Post":
+        post_consultation_mode()
 
 
 if __name__ == "__main__":
