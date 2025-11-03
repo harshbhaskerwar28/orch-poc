@@ -291,15 +291,18 @@ def booking_chat_mode():
                     if isinstance(content, str):
                         st.markdown(content)
 
-        # If last assistant message is MCQ, free input is blocked by the MCQ submit flow
-        # Otherwise, show chat input
+        # If last assistant message is MCQ, or booking is marked complete (status=="end"), disable free input
         show_free_input = True
         if st.session_state.booking_history:
             try:
                 last = st.session_state.booking_history[-1]
                 parsed = json.loads(last["content"]) if last["role"] == "assistant" else None
-                if isinstance(parsed, dict) and parsed.get("question_type") == "mcq":
-                    show_free_input = False
+                if isinstance(parsed, dict):
+                    if parsed.get("question_type") == "mcq":
+                        show_free_input = False
+                    if parsed.get("status") == "end":
+                        show_free_input = False
+                        st.success("Pre-consultation is complete. Summary has been saved.")
             except Exception:
                 pass
 
