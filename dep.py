@@ -26,10 +26,30 @@ def make_api_request(payload: dict) -> dict:
         return {"success": False, "error": f"Request failed: {str(e)}"}
 
 
-def regenerate_ids_each_run():
-    """Always regenerate session_id and user_id on every rerun."""
+def ensure_ids_once():
+    """Initialize session_id and user_id only if not already set."""
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+    if "user_id" not in st.session_state:
+        st.session_state.user_id = f"user_{str(uuid.uuid4())[:8]}"
+
+def reset_session_ids_and_state():
+    """Regenerate IDs on demand and clear chat contexts, then rerun."""
     st.session_state.session_id = str(uuid.uuid4())
     st.session_state.user_id = f"user_{str(uuid.uuid4())[:8]}"
+    # Clear histories/contexts to avoid mixing sessions
+    for key in [
+        "ask_history",
+        "booking_history",
+        "post_history",
+        "post_ctx",
+        "current_slot_id",
+        "slot_id_input_dep",
+        "post_slot_id",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.rerun()
 
 
 def _normalize_nested_json(payload):
@@ -544,8 +564,8 @@ def post_consultation_mode():
 
 
 def main():
-    # Regenerate IDs on every reload
-    regenerate_ids_each_run()
+    # Initialize IDs once; do not change across inputs
+    ensure_ids_once()
 
     st.title("🏥 Doctor Recommendation System (Deployed)")
     st.markdown("---")
@@ -568,9 +588,14 @@ def main():
         if st.button("📝 Post Consultation", use_container_width=True):
             st.session_state.dep_selected_mode = "Post"
 
-    # IDs panel
-    st.caption(f"Session ID: {st.session_state.session_id}")
-    st.caption(f"User ID: {st.session_state.user_id}")
+    # IDs panel with refresh button
+    c_sid, c_btn = st.columns([0.8, 0.2])
+    with c_sid:
+        st.caption(f"Session ID: {st.session_state.session_id}")
+        st.caption(f"User ID: {st.session_state.user_id}")
+    with c_btn:
+        if st.button("🔄 New Session", use_container_width=True):
+            reset_session_ids_and_state()
 
     st.markdown("---")
 
