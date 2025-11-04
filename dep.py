@@ -18,7 +18,7 @@ DEPLOYED_ORCH_URL = "https://dev-api-gateway.aesthatiq.com/mcp-orch-service/orch
 def make_api_request(payload: dict) -> dict:
     """POST to deployed orch endpoint and return dict with success/data or error."""
     try:
-        resp = requests.post(DEPLOYED_ORCH_URL, json=payload, timeout=60)
+        resp = requests.post(DEPLOYED_ORCH_URL, json=payload, timeout=240)
         if resp.status_code == 200:
             return {"success": True, "data": resp.json()}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
