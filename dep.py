@@ -108,6 +108,20 @@ def render_json_response_block(response_payload):
                     st.caption(f"Date: {ctx.get('date', 'N/A')}")
                     st.caption(f"Time: {ctx.get('time', 'N/A')}")
 
+        # Render products if present
+        if isinstance(parsed.get("products"), list) and parsed.get("products"):
+            st.markdown("---")
+            with st.expander("Products", expanded=True):
+                for product in parsed.get("products", []):
+                    st.markdown(f"- {product}")
+
+        # Render lab tests if present
+        if isinstance(parsed.get("lab_tests"), list) and parsed.get("lab_tests"):
+            st.markdown("---")
+            with st.expander("Lab Tests", expanded=True):
+                for test in parsed.get("lab_tests", []):
+                    st.markdown(f"- {test}")
+
         return
 
     # Fallback: show as plain text
@@ -528,6 +542,16 @@ def post_consultation_mode():
                                     st.markdown("#### Warnings")
                                     for w in parsed.get("warnings", []):
                                         st.markdown(f"- {w}")
+                                if isinstance(parsed.get("products"), list) and parsed.get("products"):
+                                    st.markdown("---")
+                                    with st.expander("Products", expanded=True):
+                                        for product in parsed.get("products", []):
+                                            st.markdown(f"- {product}")
+                                if isinstance(parsed.get("lab_tests"), list) and parsed.get("lab_tests"):
+                                    st.markdown("---")
+                                    with st.expander("Lab Tests", expanded=True):
+                                        for test in parsed.get("lab_tests", []):
+                                            st.markdown(f"- {test}")
                                 # Show full JSON for debugging/inspection
                                 with st.expander("Raw JSON"):
                                     st.json(parsed)
@@ -614,5 +638,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
