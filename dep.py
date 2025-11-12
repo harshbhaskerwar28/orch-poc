@@ -86,6 +86,65 @@ def _normalize_nested_json(payload):
     return current
 
 
+def _prepare_response_content(data):
+    """Normalize API responses into a JSON string with expected keys."""
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, dict):
+        return json.dumps(data)
+
+    payload = {}
+
+    def _add(key, alias=None):
+        value = data.get(key)
+        if value in (None, "", [], {}):
+            if alias:
+                value = data.get(alias)
+        if value not in (None, "", [], {}):
+            payload[key] = value
+
+    for item in [
+        "answer",
+        "question_type",
+        "mcq_question",
+        "mcq_options",
+        "booking_context",
+        "assessment_progress",
+        "recommendations",
+        "next_steps",
+        "sources",
+        "success",
+        "treatment_plan",
+        "additional_recommendations",
+        "warnings",
+        "products",
+        "lab_tests",
+        "chat_summary",
+    ]:
+        if isinstance(data.get(item), (dict, list)) and not data.get(item):
+            continue
+        _add(item)
+
+    # Backwards compatibility for legacy keys
+    _add("status")
+    _add("response")
+
+    if not payload and "response" in data:
+        inner = data["response"]
+        if isinstance(inner, (dict, list)):
+            return _prepare_response_content(inner)
+        if inner not in (None, ""):
+            payload["response"] = inner
+
+    if not payload and "answer" in data:
+        payload["answer"] = data["answer"]
+
+    if not payload:
+        return json.dumps(data)
+
+    return json.dumps(payload)
+
+
 def render_json_response_block(response_payload):
     """Render a rich view for dict/JSON string; fallback to plain text for others."""
     parsed = _normalize_nested_json(response_payload)
@@ -94,6 +153,50 @@ def render_json_response_block(response_payload):
         # Show main answer text
         if parsed.get("answer"):
             st.markdown(parsed["answer"])
+        elif parsed.get("response"):
+            resp_val = parsed["response"]
+            if isinstance(resp_val, str):
+                st.markdown(resp_val)
+            else:
+                st.json(resp_val)
+
+        # Display recommendations, next steps, chat summary
+        if isinstance(parsed.get("recommendations"), list) and parsed["recommendations"]:
+            st.markdown("#### Recommendations")
+            for rec in parsed["recommendations"]:
+                st.markdown(f"- {rec}")
+
+        if isinstance(parsed.get("next_steps"), list) and parsed["next_steps"]:
+            st.markdown("#### Next Steps")
+            for step in parsed["next_steps"]:
+                st.markdown(f"- {step}")
+
+        if isinstance(parsed.get("additional_recommendations"), list) and parsed["additional_recommendations"]:
+            st.markdown("#### Additional Recommendations")
+            for item in parsed["additional_recommendations"]:
+                st.markdown(f"- {item}")
+
+        if isinstance(parsed.get("warnings"), list) and parsed["warnings"]:
+            st.markdown("#### Warnings")
+            for warn in parsed["warnings"]:
+                st.markdown(f"- {warn}")
+
+        summary_content = (
+            parsed.get("assessment_summary")
+            or parsed.get("booking_summary")
+            or parsed.get("summary")
+        )
+        if summary_content:
+            st.markdown("#### Summary")
+            if isinstance(summary_content, list):
+                for item in summary_content:
+                    st.markdown(f"- {item}")
+            else:
+                st.markdown(summary_content)
+
+        if parsed.get("chat_summary"):
+            st.markdown("#### Chat Summary")
+            st.markdown(parsed["chat_summary"])
 
         # Minimal booking context card if present
         ctx = parsed.get("booking_context")
@@ -107,6 +210,17 @@ def render_json_response_block(response_payload):
                 with cols[1]:
                     st.caption(f"Date: {ctx.get('date', 'N/A')}")
                     st.caption(f"Time: {ctx.get('time', 'N/A')}")
+
+        # Assessment progress
+        progress = parsed.get("assessment_progress") or parsed.get("status")
+        if isinstance(progress, str):
+            st.caption(f"Assessment progress: {progress}")
+
+        if isinstance(parsed.get("sources"), list) and parsed["sources"]:
+            st.caption(f"Sources: {', '.join(str(src) for src in parsed['sources'])}")
+
+        if parsed.get("success") is not None:
+            st.caption(f"Success: {parsed['success']}")
 
         # Render products if present
         if isinstance(parsed.get("products"), list) and parsed.get("products"):
@@ -150,12 +264,27 @@ def render_mcq_if_present(raw_content: str, key_prefix: str, slot_id: str | None
         if not selected:
             st.warning("Please select an option before submitting.")
         else:
-            user_response = f"Selected: {selected}"
+            user_response = selected
+            with st.chat_message("user"):
+                st.markdown(selected)
+            user_msg = {"role": "user", "content": selected}
+            if slot_id and st.session_state.get("booking_history") is not None:
+                st.session_state.booking_history.append(user_msg)
+            elif st.session_state.get("post_ctx") is not None and st.session_state.get("post_history") is not None:
+                st.session_state.post_history.append(user_msg)
+            elif st.session_state.get("ask_history") is not None:
+                st.session_state.ask_history.append(user_msg)
             payload = {
                 "session_id": st.session_state.session_id,
                 "user_id": st.session_state.user_id,
                 "input": user_response,
             }
+            payload["mcq_selected_option"] = selected
+            try:
+                payload["mcq_selected_index"] = options.index(selected)
+            except ValueError:
+                pass
+            payload["mcq_question"] = mcq_question
             if slot_id:
                 payload["slot_id"] = slot_id
 
@@ -163,18 +292,7 @@ def render_mcq_if_present(raw_content: str, key_prefix: str, slot_id: str | None
                 result = make_api_request(payload)
 
             if result["success"]:
-                data = result["data"]
-                if "answer" in data:
-                    response_text = json.dumps({
-                        "answer": data.get("answer"),
-                        "question_type": data.get("question_type", "text"),
-                        "mcq_options": data.get("mcq_options", []),
-                        "mcq_question": data.get("mcq_question", ""),
-                        "booking_context": data.get("booking_context", {}),
-                        "status": data.get("status", "progress"),
-                    })
-                else:
-                    response_text = data.get("response", "No response received")
+                response_text = _prepare_response_content(result.get("data", {}))
 
                 # Append to the appropriate chat history and rerun
                 msg = {"role": "assistant", "content": response_text}
@@ -220,18 +338,7 @@ def ask_mode():
             result = make_api_request(payload)
 
         if result["success"]:
-            data = result["data"]
-            if "answer" in data:
-                response_text = json.dumps({
-                    "answer": data.get("answer"),
-                    "question_type": data.get("question_type", "text"),
-                    "mcq_options": data.get("mcq_options", []),
-                    "mcq_question": data.get("mcq_question", ""),
-                    "booking_context": data.get("booking_context", {}),
-                    "status": data.get("status", "progress"),
-                })
-            else:
-                response_text = data.get("response", "No response received")
+            response_text = _prepare_response_content(result.get("data", {}))
 
             st.session_state.ask_history.append({"role": "assistant", "content": response_text})
 
@@ -274,18 +381,7 @@ def booking_chat_mode():
             with st.spinner("Fetching booking details..."):
                 result = make_api_request(payload)
             if result["success"]:
-                data = result["data"]
-                if "answer" in data:
-                    response_text = json.dumps({
-                        "answer": data.get("answer"),
-                        "question_type": data.get("question_type", "text"),
-                        "mcq_options": data.get("mcq_options", []),
-                        "mcq_question": data.get("mcq_question", ""),
-                        "booking_context": data.get("booking_context", {}),
-                        "status": data.get("status", "progress"),
-                    })
-                else:
-                    response_text = data.get("response", "No response received")
+                response_text = _prepare_response_content(result.get("data", {}))
                 st.session_state.booking_history.append({"role": "assistant", "content": response_text})
                 st.rerun()
             else:
@@ -310,11 +406,16 @@ def booking_chat_mode():
         if st.session_state.booking_history:
             try:
                 last = st.session_state.booking_history[-1]
-                parsed = json.loads(last["content"]) if last["role"] == "assistant" else None
+                parsed = (
+                    _normalize_nested_json(last["content"])
+                    if last["role"] == "assistant"
+                    else None
+                )
                 if isinstance(parsed, dict):
                     if parsed.get("question_type") == "mcq":
                         show_free_input = False
-                    if parsed.get("status") == "end":
+                    progress = parsed.get("assessment_progress") or parsed.get("status")
+                    if isinstance(progress, str) and progress.lower() in {"end", "complete", "completed"}:
                         show_free_input = False
                         st.success("Pre-consultation is complete. Summary has been saved.")
             except Exception:
@@ -337,18 +438,7 @@ def booking_chat_mode():
                     result = make_api_request(payload)
 
                 if result["success"]:
-                    data = result["data"]
-                    if "answer" in data:
-                        response_text = json.dumps({
-                            "answer": data.get("answer"),
-                            "question_type": data.get("question_type", "text"),
-                            "mcq_options": data.get("mcq_options", []),
-                            "mcq_question": data.get("mcq_question", ""),
-                            "booking_context": data.get("booking_context", {}),
-                            "status": data.get("status", "progress"),
-                        })
-                    else:
-                        response_text = data.get("response", "No response received")
+                    response_text = _prepare_response_content(result.get("data", {}))
                     st.session_state.booking_history.append({"role": "assistant", "content": response_text})
                     with st.chat_message("assistant"):
                         if not render_mcq_if_present(response_text, key_prefix=f"book_{len(st.session_state.booking_history)}", slot_id=st.session_state.current_slot_id):
@@ -516,15 +606,15 @@ def post_consultation_mode():
                     content = msg.get("content")
                     if msg["role"] == "assistant":
                         # Render answer and treatment plan
-                        parsed = _normalize_nested_json(content)
-                        # Try MCQ first for post-consultation flow
-                        if isinstance(parsed, (str, dict)) and render_mcq_if_present(
-                            parsed if isinstance(parsed, str) else json.dumps(parsed),
-                            key_prefix=f"post_hist_{idx}",
-                            slot_id=st.session_state.post_ctx["slot_id"],
-                        ):
-                            pass
-                        else:
+                        handled_mcq = False
+                        if isinstance(content, (str, dict)):
+                            handled_mcq = render_mcq_if_present(
+                                content,
+                                key_prefix=f"post_hist_{idx}",
+                                slot_id=st.session_state.post_ctx["slot_id"],
+                            )
+                        if not handled_mcq:
+                            parsed = _normalize_nested_json(content)
                             if isinstance(parsed, dict):
                                 ans = parsed.get("answer")
                                 if isinstance(ans, str) and ans.strip():
@@ -580,11 +670,8 @@ def post_consultation_mode():
                 result = make_api_request(payload)
 
             if result.get("success"):
-                data = result["data"]
-                parsed = _normalize_nested_json(data.get("response", {}))
-                if not isinstance(parsed, dict) or not parsed:
-                    parsed = _normalize_nested_json(data.get("answer", {}))
-                st.session_state.post_history.append({"role": "assistant", "content": parsed or (data.get("response") or data.get("answer") or "")})
+                response_text = _prepare_response_content(result.get("data", {}))
+                st.session_state.post_history.append({"role": "assistant", "content": response_text})
                 st.rerun()
             else:
                 st.error(result.get("error", "Unknown error"))
