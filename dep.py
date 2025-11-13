@@ -145,12 +145,17 @@ def _prepare_response_content(data):
     return json.dumps(payload)
 
 
-def render_json_response_block(response_payload):
-    """Render a rich view for dict/JSON string; fallback to plain text for others."""
+def render_json_response_block(response_payload, show_mcq=True):
+    """Render a rich view for dict/JSON string; fallback to plain text for others.
+    
+    Args:
+        response_payload: The response to render
+        show_mcq: If True, will render MCQ if present. If False, only shows answer text.
+    """
     parsed = _normalize_nested_json(response_payload)
     
     if isinstance(parsed, dict):
-        # Show main answer text
+        # Show main answer text FIRST (even if MCQ is present)
         if parsed.get("answer"):
             st.markdown(parsed["answer"])
         elif parsed.get("response"):
@@ -243,7 +248,10 @@ def render_json_response_block(response_payload):
 
 
 def render_mcq_if_present(raw_content: str, key_prefix: str, slot_id: str | None):
-    """Render MCQ inputs if payload indicates an MCQ; return True if MCQ handled (blocks free input)."""
+    """Render MCQ inputs if payload indicates an MCQ; return True if MCQ handled (blocks free input).
+    
+    Note: This should be called AFTER render_json_response_block to show answer text first.
+    """
     parsed = _normalize_nested_json(raw_content)
     if not isinstance(parsed, dict):
         return False
@@ -256,6 +264,8 @@ def render_mcq_if_present(raw_content: str, key_prefix: str, slot_id: str | None
     if not options:
         return False
 
+    # Show MCQ question and options
+    st.markdown("---")
     st.markdown(f"#### {mcq_question}")
     selected = st.radio("Choose answer:", options, key=f"{key_prefix}_mcq_radio", index=None)
 
@@ -264,29 +274,43 @@ def render_mcq_if_present(raw_content: str, key_prefix: str, slot_id: str | None
         if not selected:
             st.warning("Please select an option before submitting.")
         else:
+            # Add user message to history BEFORE making API call
             user_response = selected
-            with st.chat_message("user"):
-                st.markdown(selected)
             user_msg = {"role": "user", "content": selected}
+            
+            # Add to appropriate history based on context
             if slot_id and st.session_state.get("booking_history") is not None:
                 st.session_state.booking_history.append(user_msg)
             elif st.session_state.get("post_ctx") is not None and st.session_state.get("post_history") is not None:
                 st.session_state.post_history.append(user_msg)
             elif st.session_state.get("ask_history") is not None:
                 st.session_state.ask_history.append(user_msg)
+            
+            # Build payload with selected option as input
             payload = {
                 "session_id": st.session_state.session_id,
                 "user_id": st.session_state.user_id,
-                "input": user_response,
+                "input": user_response,  # Selected option goes here
             }
+            
+            # Add MCQ metadata
             payload["mcq_selected_option"] = selected
             try:
                 payload["mcq_selected_index"] = options.index(selected)
             except ValueError:
                 pass
             payload["mcq_question"] = mcq_question
+            
+            # Add slot_id if in booking or post consultation context
             if slot_id:
                 payload["slot_id"] = slot_id
+            elif st.session_state.get("post_ctx") is not None:
+                # Post consultation also uses slot_id
+                payload["slot_id"] = st.session_state.post_ctx["slot_id"]
+            
+            # Add post_consultation_text if in post consultation context
+            if st.session_state.get("post_ctx") is not None:
+                payload["post_consultation_text"] = st.session_state.post_ctx["post_text"]
 
             with st.spinner("Processing your answer..."):
                 result = make_api_request(payload)
@@ -294,12 +318,14 @@ def render_mcq_if_present(raw_content: str, key_prefix: str, slot_id: str | None
             if result["success"]:
                 response_text = _prepare_response_content(result.get("data", {}))
 
-                # Append to the appropriate chat history and rerun
+                # Append assistant response to the appropriate chat history and rerun
                 msg = {"role": "assistant", "content": response_text}
                 if "current_slot_id" in st.session_state and st.session_state.get("booking_history") is not None:
                     st.session_state.booking_history.append(msg)
                 if st.session_state.get("post_ctx") is not None and st.session_state.get("post_history") is not None:
                     st.session_state.post_history.append(msg)
+                if st.session_state.get("ask_history") is not None:
+                    st.session_state.ask_history.append(msg)
                 st.rerun()
             else:
                 st.error(result.get("error", "Unknown error"))
@@ -343,9 +369,10 @@ def ask_mode():
             st.session_state.ask_history.append({"role": "assistant", "content": response_text})
 
             with st.chat_message("assistant"):
-                # If MCQ, render picker and handle
-                if not render_mcq_if_present(response_text, key_prefix=f"ask_{len(st.session_state.ask_history)}", slot_id=None):
-                    render_json_response_block(response_text)
+                # First show answer text and other content
+                render_json_response_block(response_text, show_mcq=False)
+                # Then render MCQ if present
+                render_mcq_if_present(response_text, key_prefix=f"ask_{len(st.session_state.ask_history)}", slot_id=None)
         else:
             err = result["error"]
             st.session_state.ask_history.append({"role": "assistant", "content": f"Error: {err}"})
@@ -376,14 +403,14 @@ def booking_chat_mode():
                 "session_id": st.session_state.session_id,
                 "user_id": st.session_state.user_id,
                 "slot_id": st.session_state.current_slot_id
-                # no 'input' key at all
+                # no 'input' key at all - this triggers initial greeting
             }
             with st.spinner("Fetching booking details..."):
                 result = make_api_request(payload)
             if result["success"]:
                 response_text = _prepare_response_content(result.get("data", {}))
                 st.session_state.booking_history.append({"role": "assistant", "content": response_text})
-                st.rerun()
+                st.rerun()  # Rerun to show the response in history rendering below
             else:
                 st.error(result.get("error", "Unknown error"))
 
@@ -393,9 +420,10 @@ def booking_chat_mode():
                 if msg["role"] == "assistant":
                     content = msg.get("content")
                     if isinstance(content, (str, dict)):
-                        # Try MCQ render; if not MCQ, show rich JSON
-                        if not render_mcq_if_present(content, key_prefix=f"book_hist_{idx}", slot_id=st.session_state.current_slot_id):
-                            render_json_response_block(content)
+                        # First show answer text and other content
+                        render_json_response_block(content, show_mcq=False)
+                        # Then render MCQ if present (this will show MCQ question and options)
+                        render_mcq_if_present(content, key_prefix=f"book_hist_{idx}", slot_id=st.session_state.current_slot_id)
                 else:
                     content = msg.get("content")
                     if isinstance(content, str):
@@ -441,8 +469,10 @@ def booking_chat_mode():
                     response_text = _prepare_response_content(result.get("data", {}))
                     st.session_state.booking_history.append({"role": "assistant", "content": response_text})
                     with st.chat_message("assistant"):
-                        if not render_mcq_if_present(response_text, key_prefix=f"book_{len(st.session_state.booking_history)}", slot_id=st.session_state.current_slot_id):
-                            render_json_response_block(response_text)
+                        # First show answer text and other content
+                        render_json_response_block(response_text, show_mcq=False)
+                        # Then render MCQ if present
+                        render_mcq_if_present(response_text, key_prefix=f"book_{len(st.session_state.booking_history)}", slot_id=st.session_state.current_slot_id)
                 else:
                     err = result["error"]
                     st.session_state.booking_history.append({"role": "assistant", "content": f"Error: {err}"})
@@ -590,91 +620,56 @@ def post_consultation_mode():
         if not slot_id or not post_text.strip():
             st.warning("Please enter both Slot ID and Post Consultation Text.")
             return
-        # Save context for chat; do NOT call API yet. Chat input will trigger first call.
+        # Save context and make initial API call immediately
         st.session_state.post_ctx = {"slot_id": slot_id, "post_text": post_text}
         st.session_state.post_history = []
-        st.success("Context saved. You can now chat to generate or refine the treatment plan.")
+        
+        # Make initial API call with post_consultation_text (no input field)
+        payload = {
+            "session_id": st.session_state.session_id,
+            "user_id": st.session_state.user_id,
+            "slot_id": slot_id,
+            "post_consultation_text": post_text,
+            # No 'input' key - this triggers initial treatment plan generation
+        }
+        with st.spinner("Generating treatment plan..."):
+            result = make_api_request(payload)
+        
+        if result.get("success"):
+            response_text = _prepare_response_content(result.get("data", {}))
+            st.session_state.post_history.append({"role": "assistant", "content": response_text})
+            st.rerun()
+        else:
+            st.error(result.get("error", "Unknown error"))
 
     # If context set, render chat-style interface
     if st.session_state.post_ctx:
         st.info(f"Current Slot ID: {st.session_state.post_ctx['slot_id']}")
 
-        chat_container = st.container()
-        with chat_container:
-            for idx, msg in enumerate(st.session_state.post_history):
-                with st.chat_message(msg["role"]):
+        # Render history
+        for idx, msg in enumerate(st.session_state.post_history):
+            with st.chat_message(msg["role"]):
+                if msg["role"] == "assistant":
                     content = msg.get("content")
-                    if msg["role"] == "assistant":
-                        # Render answer and treatment plan
-                        handled_mcq = False
-                        if isinstance(content, (str, dict)):
-                            handled_mcq = render_mcq_if_present(
-                                content,
-                                key_prefix=f"post_hist_{idx}",
-                                slot_id=st.session_state.post_ctx["slot_id"],
-                            )
-                        if not handled_mcq:
-                            parsed = _normalize_nested_json(content)
-                            if isinstance(parsed, dict):
-                                ans = parsed.get("answer")
-                                if isinstance(ans, str) and ans.strip():
-                                    st.markdown(ans)
-                                plan = parsed.get("treatment_plan")
-                                if plan:
-                                    st.markdown("---")
-                                    st.markdown("## Treatment Plan")
-                                    _render_treatment_plan(plan)
-                                if parsed.get("additional_recommendations"):
-                                    st.markdown("#### Additional Recommendations")
-                                    for rec in parsed.get("additional_recommendations", []):
-                                        st.markdown(f"- {rec}")
-                                if parsed.get("warnings"):
-                                    st.markdown("#### Warnings")
-                                    for w in parsed.get("warnings", []):
-                                        st.markdown(f"- {w}")
-                                if isinstance(parsed.get("products"), list) and parsed.get("products"):
-                                    st.markdown("---")
-                                    with st.expander("Products", expanded=True):
-                                        for product in parsed.get("products", []):
-                                            st.markdown(f"- {product}")
-                                if isinstance(parsed.get("lab_tests"), list) and parsed.get("lab_tests"):
-                                    st.markdown("---")
-                                    with st.expander("Lab Tests", expanded=True):
-                                        for test in parsed.get("lab_tests", []):
-                                            st.markdown(f"- {test}")
-                                # Show full JSON for debugging/inspection
-                                with st.expander("Raw JSON"):
-                                    st.json(parsed)
-                            elif isinstance(content, str):
-                                st.markdown(content)
-                    else:
-                        if isinstance(content, str):
-                            st.markdown(content)
-
-        # Chat input for follow-ups
-        user_msg = st.chat_input("Ask follow-up or refine plan...")
-        if user_msg:
-            st.session_state.post_history.append({"role": "user", "content": user_msg})
-            with st.chat_message("user"):
-                st.markdown(user_msg)
-
-            ctx = st.session_state.post_ctx
-            payload = {
-                "session_id": st.session_state.session_id,
-                "user_id": st.session_state.user_id,
-                "slot_id": ctx["slot_id"],
-                "post_consultation_text": ctx["post_text"],
-                "input": user_msg,
-            }
-            with st.spinner("Processing..."):
-                result = make_api_request(payload)
-
-            if result.get("success"):
-                response_text = _prepare_response_content(result.get("data", {}))
-                st.session_state.post_history.append({"role": "assistant", "content": response_text})
-                st.rerun()
-            else:
-                st.error(result.get("error", "Unknown error"))
+                    if isinstance(content, (str, dict)):
+                        # First show answer text and other content using standard renderer
+                        render_json_response_block(content, show_mcq=False)
+                        
+                        # Then render treatment plan if present (custom rendering)
+                        parsed = _normalize_nested_json(content)
+                        if isinstance(parsed, dict):
+                            plan = parsed.get("treatment_plan")
+                            if plan:
+                                st.markdown("---")
+                                st.markdown("## Treatment Plan")
+                                _render_treatment_plan(plan)
+                        
+                        # Then render MCQ if present
+                        render_mcq_if_present(content, key_prefix=f"post_hist_{idx}", slot_id=st.session_state.post_ctx["slot_id"])
+                else:
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        st.markdown(content)
 
 
 def main():
